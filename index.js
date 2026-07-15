@@ -10,6 +10,25 @@ import { join } from "node:path";
 import { createServer } from "node:http";
 import { request as undiciRequest } from "undici";
 
+// undici does not follow redirects by default. The app's canonical host
+// may 307-redirect (e.g. apex → www), which breaks POSTs. This helper
+// re-issues the same method/headers/body up to `maxRedirects` times.
+async function httpRequest(url, options = {}, maxRedirects = 5) {
+  let currentUrl = url;
+  for (let i = 0; i <= maxRedirects; i++) {
+    const res = await undiciRequest(currentUrl, options);
+    if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+      const next = new URL(res.headers.location, currentUrl).toString();
+      try { await res.body.dump(); } catch { /* noop */ }
+      console.warn(`redirect ${res.statusCode} ${currentUrl} -> ${next}`);
+      currentUrl = next;
+      continue;
+    }
+    return res;
+  }
+  throw new Error(`too many redirects for ${url}`);
+}
+
 const APP_URL = requireAnyEnv(["APP_URL", "PUBLIC_APP_URL", "VSCOUT_APP_URL"]).replace(/\/$/, "");
 const SECRET = requireAnyEnv(["WORKER_SHARED_SECRET", "VIDEO_WORKER_SHARED_SECRET"]);
 const WORKER_ID = process.env.WORKER_ID || hostname();
@@ -91,7 +110,7 @@ async function checkFfmpeg() {
 
 async function checkAppBridge() {
   try {
-    const res = await undiciRequest(`${APP_URL}/api/public/hooks/worker-health`, {
+    const res = await httpRequest(`${APP_URL}/api/public/hooks/worker-health`, {
       method: "GET",
       headers: { "x-worker-secret": SECRET },
     });
@@ -118,31 +137,37 @@ async function healthPayload() {
 async function claimJobs(batch, clipId) {
   const body = { worker_id: WORKER_ID, batch_size: batch };
   if (clipId) body.clip_id = clipId;
-  const res = await undiciRequest(`${APP_URL}/api/public/hooks/claim-clip-jobs`, {
+  const endpoint = `${APP_URL}/api/public/hooks/claim-clip-jobs`;
+  const res = await httpRequest(endpoint, {
     method: "POST",
     headers: { "content-type": "application/json", "x-worker-secret": SECRET },
     body: JSON.stringify(body),
   });
   if (res.statusCode !== 200) {
     const bodyText = await res.body.text();
-    throw new Error(`claim failed ${res.statusCode}: ${bodyText}`);
+    throw new Error(`claim failed ${res.statusCode} at ${endpoint}: ${truncate(bodyText, 300)}`);
   }
   const data = await res.body.json();
+  console.log(`claim ${endpoint} -> 200 jobs=${(data.jobs || []).length}`);
   return data.jobs || [];
 }
 
 async function reportOutcome(clipId, payload) {
+  const endpoint = `${APP_URL}/api/public/hooks/complete-clip-job`;
   try {
-    const res = await undiciRequest(`${APP_URL}/api/public/hooks/complete-clip-job`, {
+    const res = await httpRequest(endpoint, {
       method: "POST",
       headers: { "content-type": "application/json", "x-worker-secret": SECRET },
       body: JSON.stringify({ clip_id: clipId, worker_id: WORKER_ID, ...payload }),
     });
+    const text = await res.body.text();
     if (res.statusCode !== 200) {
-      console.error(`report ${clipId} status ${res.statusCode}`, await res.body.text());
+      console.error(`report ${endpoint} clip=${clipId} status=${res.statusCode} body=${truncate(text, 300)}`);
+    } else {
+      console.log(`report ${endpoint} clip=${clipId} status=200 ok=${payload.ok}`);
     }
   } catch (err) {
-    console.error(`report ${clipId} threw`, err);
+    console.error(`report ${endpoint} clip=${clipId} threw`, err);
   }
 }
 
@@ -174,7 +199,7 @@ async function ffmpegCut(sourceUrl, start, duration, outputPath) {
 
 async function uploadClip(uploadUrl, filePath) {
   const buf = await readFile(filePath);
-  const res = await undiciRequest(uploadUrl, {
+  const res = await httpRequest(uploadUrl, {
     method: "PUT",
     headers: { "content-type": "video/mp4" },
     body: buf,
